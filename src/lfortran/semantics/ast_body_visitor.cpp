@@ -4567,18 +4567,89 @@ public:
     // TODO: add SymbolTable::get_symbol(), which will only check in Debug mode
         SymbolTable *old_scope = current_scope;
         ASR::symbol_t *t = current_scope->get_symbol(to_lower(x.m_name));
-        starting_m_body = x.m_body;
-        starting_n_body = x.n_body;
-        collect_labels();
+        if (!t) {
+            if (!compiler_options.continue_compilation) {
+                diag.add(Diagnostic(
+                    "Subroutine '" + std::string(x.m_name) + "' not found",
+                    Level::Error, Stage::Semantic, {
+                        Label("", {x.base.base.loc})
+                    }
+                ));
+                throw SemanticAbort();
+            } else {
+                // In continue_compilation mode, just skip processing
+                return;
+            }
+        }
+
         if( t->type == ASR::symbolType::GenericProcedure ) {
             std::string subrout_name = to_lower(x.m_name) + "~genericprocedure";
             t = current_scope->get_symbol(subrout_name);
+            if (!t) {
+                if (!compiler_options.continue_compilation) {
+                    diag.add(Diagnostic(
+                        "Subroutine '" + std::string(x.m_name) + "'not found",
+                        Level::Error, Stage::Semantic, {
+                            Label("", {x.base.base.loc})
+                        }
+                    ));
+                    throw SemanticAbort();
+                } else {
+                    return;
+                }
+            }
         }
 
+        starting_m_body = x.m_body;
+        starting_n_body = x.n_body;
+        collect_labels();
+        
         if (x.n_temp_args > 0) {
-            t = ASRUtils::symbol_symtab(t)->get_symbol(to_lower(x.m_name));
+            SymbolTable *symtab = ASRUtils::symbol_symtab(t);
+            if (!symtab) {
+                if (!compiler_options.continue_compilation) {
+                    diag.add(Diagnostic(
+                        "Internal error: symbol table missing for '" + std::string(x.m_name) + "'"
+                        Level::Error, Stage::Semantic, {
+                            Label("", {x.base.base.loc})
+                        }
+                    ));
+                    throw SemanticAbort();
+                } else {
+                    return;
+                }
+            }   
+
+            t = symtab->get_symbol(to_lower(x.m_name));
+
+            if (!t) {
+                if (!compiler_options.continue_compilation) {
+                    diag.add(Diagnostic(
+                        "Templated subroutine '" + std::string(x.m_name) + "'not found",
+                        Level::Error, Stage::Semantic, {
+                            Label("", {x.base.base.loc})
+                        }
+                    ));
+                    throw SemanticAbort();
+                } else {
+                    return;
+                }
+            }
         }
 
+        if (!ASR::is_a<ASR::Function_t>(*t)) {
+            if (!compiler_options.continue_compilation) {
+                diag.add(Diagnostic(
+                    "Expected a function/subroutine symbol for '" + std::string(x.m_name) + "'",
+                    Level::Error, Stage::Semantic, {
+                        Label("", {x.base.base.loc})
+                    }
+                ));
+                throw SemanticAbort();
+            } else {
+                return;
+            }
+        }
         ASR::Function_t *v = ASR::down_cast<ASR::Function_t>(t);
         current_scope = v->m_symtab;
         for (size_t i=0; i<x.n_decl; i++) {
