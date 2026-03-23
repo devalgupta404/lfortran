@@ -15312,6 +15312,8 @@ public:
             this->visit_stmt(*x.m_overloaded);
             return ;
         }
+        bool is_unit_string = false;
+        bool is_internal_read = false;
 
         // Handle namelist read
         if (x.m_nml) {
@@ -15469,14 +15471,19 @@ public:
         llvm::Value *advance, *advance_length;
         llvm::Value *iostat_user = nullptr; // User's iostat variable 
         int iostat_kind = 4; // kind of iostat variable (default INT32)
-        bool is_string = false;
+        is_unit_string = false;
         if (x.m_unit == nullptr) {
             // Read from stdin
             unit_val = llvm::ConstantInt::get(
                     llvm::Type::getInt32Ty(context), llvm::APInt(32, -1, true));
         } else {
-            is_string = ASRUtils::is_character(*expr_type(x.m_unit));
-            this->visit_expr_load_wrapper(x.m_unit, (is_string ? 0 : 1), true);
+            is_unit_string = ASRUtils::is_character(*expr_type(x.m_unit));
+            is_internal_read = is_unit_string;
+            if (is_unit_string) {
+                this->visit_expr_load_wrapper(x.m_unit, 0, true);
+            } else {
+            this->visit_expr_load_wrapper(x.m_unit, 1, true);
+            }
             unit_val = tmp;
             if(ASRUtils::is_integer(*ASRUtils::expr_type(x.m_unit))){
                 // Convert the unit to 32 bit integer (We only support unit number up to 1000).
@@ -15566,7 +15573,7 @@ public:
         }
 
         // Handle pos= specifier: seek to the specified position before reading
-        if (x.m_pos && !is_string) {
+        if (x.m_pos && !is_unit_string) {
             this->visit_expr_wrapper(x.m_pos, true);
             llvm::Value* pos_val = tmp;
             // Convert to i64 for file position
@@ -15588,18 +15595,18 @@ public:
             builder->CreateCall(fn, {unit_val, pos_val, iostat});
         }
 
-        if (x.m_rec && !is_string) {
+        if (x.m_rec && !is_unit_string) {
             emit_seek_record_from_rec(x.m_rec, unit_val, iostat);
         }
 
         if (x.m_fmt) {
-            emit_formatted_read(x, unit_val, iostat, read_size, advance, advance_length, is_string);
+            emit_formatted_read(x, unit_val, iostat, read_size, advance, advance_length, is_unit_string);
         } else {
             llvm::Value* var_to_read_into = nullptr; // Var expression that we'll read into.
             // For multi-value list-directed internal reads, track position
             llvm::Value *str_offset = nullptr;
             llvm::Value *str_src_data = nullptr, *str_src_len = nullptr;
-            if (is_string) {
+            if (is_unit_string) {
                 str_offset = llvm_utils->CreateAlloca(*builder,
                     llvm::Type::getInt64Ty(context), nullptr, "str_read_offset");
                 builder->CreateStore(
@@ -15769,7 +15776,7 @@ public:
                     uint32_t h = get_hash((ASR::asr_t*)asr_target);
                     var_to_read_into = llvm_symtab[h];
                 }
-                if (is_string) {
+                if (is_unit_string) {
                     std::string runtime_func_name = "_lfortran_string_read_" +
                                             ASRUtils::type_to_str_python_expr(ASRUtils::extract_type(type), x.m_values[i]);
                     if (ASRUtils::is_array(type)) {
@@ -15950,7 +15957,9 @@ public:
                     emit_set_read_iomsg();
                     continue;
                 } else {
-                    fn = get_read_function(type);
+                    if(!is_internal_read) {
+                        fn = get_read_function(type);
+                    }
                 }
                 if (ASRUtils::is_array(type)) {
                     llvm::Type *el_type = llvm_utils->get_el_type(
@@ -16042,7 +16051,7 @@ public:
             // Here, we can use `_lfortran_empty_read` function to move to the
             // pointer to the next line.
             // Skip for internal (string) reads — no file position to advance.
-            if (!is_string) {
+            if (!is_unit_string) {
             std::string runtime_func_name = "_lfortran_empty_read";
             llvm::Function *fn = module->getFunction(runtime_func_name);
             if (!fn) {
@@ -16058,7 +16067,7 @@ public:
             // When x.m_iostat is provided and values were read (n_values > 0),
             // only call empty_read if no error occurred during value reads.
             // When n_values == 0, no reads happened yet so call unconditionally.
-            if (x.m_iostat && x.n_values > 0) {
+            if (x.n_values > 0) {
                 llvm::Value* iostat_val = builder->CreateLoad(
                     llvm::Type::getInt32Ty(context), iostat_for_empty_read);
                 llvm::Value* iostat_is_zero = builder->CreateICmpEQ(
@@ -20595,21 +20604,59 @@ public:
             h = get_hash((ASR::asr_t*)proc_sym);
         } else if (s_func_type->m_abi == ASR::abiType::Intrinsic) {
             if (sub_name == "get_command_argument") {
-                llvm::Function *fn = module->getFunction("_lpython_get_argv");
-                if (!fn) {
-                    llvm::FunctionType *function_type = llvm::FunctionType::get(
-                        character_type, {
-                            llvm::Type::getInt32Ty(context)
-                        }, false);
-                    fn = llvm::Function::Create(function_type,
-                        llvm::Function::ExternalLinkage, "_lpython_get_argv", module.get());
-                }
                 args = convert_call_args(x, is_method);
                 LCOMPILERS_ASSERT(args.size() > 0);
-                tmp = builder->CreateCall(fn, {llvm_utils->CreateLoad2(
-                    llvm::Type::getInt32Ty(context), args[0])});
-                if (args.size() > 1)
-                    builder->CreateStore(tmp, args[1]);
+                llvm::Value* idx = llvm_utils->CreateLoad2(
+                    llvm::Type::getInt32Ty(context), args[0]);
+
+                if (args.size() > 1) {
+                    ASR::expr_t* value_expr = x.m_args[1].m_value;
+                    ASR::ttype_t* value_type = ASRUtils::expr_type(value_expr);
+                    LCOMPILERS_ASSERT(ASRUtils::is_string_only(value_type));
+
+                    llvm::Function *fn_value = module->getFunction("_lfortran_get_command_argument_value");
+                    if (!fn_value) {
+                        llvm::FunctionType *function_type = llvm::FunctionType::get(
+                            llvm::Type::getVoidTy(context), {
+                                llvm::Type::getInt32Ty(context),
+                                character_type
+                            }, false);
+                        fn_value = llvm::Function::Create(function_type,
+                            llvm::Function::ExternalLinkage, "_lfortran_get_command_argument_value", module.get());
+                    }
+
+                    llvm::Value *dest_data, *dest_len;
+                    std::tie(dest_data, dest_len) = get_string_data_and_length(value_expr);
+                    builder->CreateCall(fn_value, {idx, dest_data});
+                }
+
+                if (args.size() > 2 && x.m_args[2].m_value) {
+                    llvm::Function *fn_len = module->getFunction("_lfortran_get_command_argument_length");
+                    if (!fn_len) {
+                        llvm::FunctionType *function_type = llvm::FunctionType::get(
+                            llvm::Type::getInt32Ty(context), {
+                                llvm::Type::getInt32Ty(context)
+                            }, false);
+                        fn_len = llvm::Function::Create(function_type,
+                            llvm::Function::ExternalLinkage, "_lfortran_get_command_argument_length", module.get());
+                    }
+                    llvm::Value* len_val = builder->CreateCall(fn_len, {idx});
+                    int ptr_copy = ptr_loads;
+                    ptr_loads = 0;
+                    this->visit_expr_wrapper(x.m_args[2].m_value, false);
+                    ptr_loads = ptr_copy;
+                    builder->CreateStore(len_val, tmp);
+                }
+
+                if (args.size() > 3 && x.m_args[3].m_value) {
+                    int ptr_copy = ptr_loads;
+                    ptr_loads = 0;
+                    this->visit_expr_wrapper(x.m_args[3].m_value, false);
+                    ptr_loads = ptr_copy;
+                    builder->CreateStore(
+                        llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0),
+                        tmp);
+                }
                 return;
             } else if (sub_name == "get_environment_variable") {
                 llvm::Function *fn = module->getFunction("_lfortran_get_env_variable");
