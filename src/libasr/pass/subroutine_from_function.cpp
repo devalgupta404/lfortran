@@ -122,13 +122,17 @@ private :
     ASR::FunctionCall_t  *f_call_; // FunctionCall that we're allocating a var based on.
     SymbolTable          *current_scope_;
     Vec<ASR::stmt_t*>    &pass_result_;
+    bool create_temp_for_function_param_;
 
     AllocateVarBasedOnFuncCall(
         Allocator           &al,
         ASR::FunctionCall_t *f_call,
         SymbolTable         *current_scope,
-        Vec<ASR::stmt_t*>   &pass_result)
-        :al_(al), f_call_(f_call), current_scope_(current_scope), pass_result_(pass_result) {}
+        Vec<ASR::stmt_t*>   &pass_result,
+        bool create_temp_for_function_param=true)
+        :al_(al), f_call_(f_call), current_scope_(current_scope),
+         pass_result_(pass_result),
+         create_temp_for_function_param_(create_temp_for_function_param) {}
 
 
     /// Inserts Allocate Statement for `var_to_allocate` based on the information from `funcCall_ret_type`
@@ -196,12 +200,22 @@ private :
 
 public : 
 
+    static void replace_function_params_in_type(
+        Allocator& al,
+        ASR::FunctionCall_t* f_call,
+        ASR::ttype_t* type,
+        SymbolTable* current_scope,
+        Vec<ASR::stmt_t*>& pass_result) {
+        AllocateVarBasedOnFuncCall instance(al, f_call, current_scope, pass_result, false);
+        instance.replace_ttype(type);
+    }
+
     void replace_FunctionParam(ASR::FunctionParam_t* x){
 
         ASR::expr_t* fnCall_argument {};
         fnCall_argument = ASRUtils::get_past_array_physical_cast(f_call_->m_args[x->m_param_number].m_value); // Cleaned Up
 
-        if(ASR::is_a<ASR::FunctionCall_t>(*fnCall_argument)){ // We have to resolve the issue of double evaluation
+        if(create_temp_for_function_param_ && ASR::is_a<ASR::FunctionCall_t>(*fnCall_argument)){ // We have to resolve the issue of double evaluation
             /* Create Temporary Variable To Hold Call Return -- We'll Re-use The Temp Instead of Re-evaluating*/
             ASR::expr_t* temp_var {};
             {
@@ -385,6 +399,21 @@ private :
                 new_type = ASRUtils::TYPE(ASR::make_Allocatable_t(al, new_type->base.loc, new_type));
             }
         }
+
+        /* Handle non-fixed arrays by using deferred-shape allocatable return slots. */
+        if (ASRUtils::is_array(new_type) && !ASRUtils::is_allocatable(new_type)
+                && !ASRUtils::is_pointer(new_type)) {
+            ASR::dimension_t* m_dims = nullptr;
+            int n_dims = 0;
+            PassUtils::get_dim_rank(new_type, m_dims, n_dims);
+            if (!ASRUtils::is_fixed_size_array(m_dims, n_dims)) {
+                new_type = ASRUtils::TYPE(ASRUtils::make_Allocatable_t_util(
+                    al, new_type->base.loc,
+                    ASRUtils::type_get_past_allocatable(
+                        ASRUtils::duplicate_type_with_empty_dims(al, new_type))));
+            }
+        }
+
         return new_type;
     }
 
@@ -408,9 +437,12 @@ public :
         // it element-wise.
         if (func && ASRUtils::is_elemental(x->m_name) && !was_converted
                 && PassUtils::is_aggregate_or_array_type(x->m_type)) {
+            ASR::ttype_t* result_var_type = create_type_for_return_slot_var(x->m_type);
+            AllocateVarBasedOnFuncCall::replace_function_params_in_type(
+                al, x, result_var_type, current_scope, pass_result);
             ASR::expr_t* result_var = PassUtils::create_var(
                 result_counter++, "return_slot", x->base.base.loc,
-                create_type_for_return_slot_var(x->m_type), al,
+                result_var_type, al,
                 current_scope, nullptr);
             ASR::stmt_t* assign = ASRUtils::STMT(ASR::make_Assignment_t(
                 al, x->base.base.loc, result_var,
@@ -427,10 +459,13 @@ public :
             // the sibling so create_var can extract the type_decl symbol.
             ASR::expr_t* sibling_var = (was_converted && func->n_args > 0)
                 ? func->m_args[func->n_args - 1] : nullptr;
+            ASR::ttype_t* result_var_type = create_type_for_return_slot_var(x->m_type);
+            AllocateVarBasedOnFuncCall::replace_function_params_in_type(
+                al, x, result_var_type, current_scope, pass_result);
             ASR::expr_t* result_var = PassUtils::create_var(
                                             result_counter++,
                                             "return_slot", x->base.base.loc,
-                                            create_type_for_return_slot_var(x->m_type) , al, current_scope, sibling_var);
+                                            result_var_type, al, current_scope, sibling_var);
 
             /* Make Sure To Deallocate -- To Avoid Douple Allocation With Loops */
             if(ASRUtils::is_allocatable(ASRUtils::expr_type(result_var))) { insert_implicit_deallocate(result_var); }
@@ -623,6 +658,21 @@ class ReplaceFunctionCallWithSubroutineCallVisitor:
                 current_expr = &fc->m_dt;
                 call_replacer();
                 current_expr = current_expr_copy;
+            }
+
+            // Keep declaration-time shape expressions in sync with the lowered
+            // function-call arguments so generated automatic arrays do not
+            // depend on a different internal return slot than the call path.
+            if (ASR::is_a<ASR::Var_t>(*target)) {
+                ASR::symbol_t* target_sym = ASR::down_cast<ASR::Var_t>(target)->m_v;
+                if (ASR::is_a<ASR::Variable_t>(*target_sym)) {
+                    ASR::Variable_t* target_var = ASR::down_cast<ASR::Variable_t>(target_sym);
+                    ASR::ttype_t* synced_target_type = ASRUtils::duplicate_type(al, fc->m_type);
+                    AllocateVarBasedOnFuncCall::replace_function_params_in_type(
+                        al, fc, synced_target_type, current_scope, pass_result);
+                    replacer.replace_ttype(synced_target_type);
+                    target_var->m_type = synced_target_type;
+                }
             }
 
             ASR::symbol_t* func_sym = ASRUtils::symbol_get_past_external(fc->m_name);
